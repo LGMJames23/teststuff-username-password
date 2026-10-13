@@ -1,0 +1,6 @@
+body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; background:#f6f7fb; margin:0; }
+.container{ max-width:720px; margin:40px auto; padding:20px }
+.card{ background:white; padding:16px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,0.06); margin-bottom:16px }
+input{ padding:8px 10px; width:100%; box-sizing:border-box; margin:6px 0 }
+button{ padding:10px 12px; cursor:pointer }
+.status{ color:#555; margin-top:8px }
