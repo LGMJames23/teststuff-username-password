@@ -1,26 +1,37 @@
-from flask import Flask, request, jsonify, render_template, g
 import os
 import sqlite3
+import datetime
+from datetime import timezone
+from flask import Flask, request, jsonify, render_template, g, make_response
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 import jwt
-import datetime
 
 # Configuration
+ENV = os.environ.get('FLASK_ENV', 'production')
 DATABASE = os.environ.get('DB_PATH', 'users.db')
-SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-change-me')
+SECRET_KEY = os.environ.get('SECRET_KEY')
+
+if not SECRET_KEY:
+    if ENV == 'production':
+        raise ValueError("CRITICAL: SECRET_KEY environment variable must be set in production.")
+    SECRET_KEY = 'dev-secret-key-change-in-production'
+
 JWT_ALGORITHM = 'HS256'
 JWT_EXP_DELTA_SECONDS = 3600  # 1 hour
+COOKIE_NAME = 'access_token'
 
 app = Flask(__name__)
 ph = PasswordHasher()
 
-# Database helpers
+# Database setup
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
+        db = g._database = sqlite3.connect(DATABASE, timeout=10)
         db.row_factory = sqlite3.Row
+        # Enable Write-Ahead Logging for higher concurrent read/write performance
+        db.execute('PRAGMA journal_mode=WAL;')
     return db
 
 @app.teardown_appcontext
@@ -30,15 +41,47 @@ def close_connection(exception):
         db.close()
 
 def init_db():
-    db = get_db()
-    db.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
-        )
-    ''')
-    db.commit()
+    with app.app_context():
+        db = get_db()
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        db.commit()
+
+init_db()
+
+# Security Header Middleware
+@app.after_request
+def apply_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    return response
+
+# Token Retrieval Helper
+def get_jwt_payload():
+    token = request.cookies.get(COOKIE_NAME)
+    
+    if not token:
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header.split(' ', 1)[1]
+
+    if not token:
+        return None, ('Missing authentication token', 401)
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return payload, None
+    except jwt.ExpiredSignatureError:
+        return None, ('Token has expired', 401)
+    except jwt.InvalidTokenError:
+        return None, ('Invalid token', 401)
 
 # Routes
 @app.route('/')
@@ -48,72 +91,84 @@ def index():
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json() or {}
-    username = (data.get('username') or '').strip()
+    username = (data.get('username') or '').strip().lower()
     password = data.get('password') or ''
+
     if not username or not password:
-        return jsonify({'error': 'username and password are required'}), 400
+        return jsonify({'error': 'Username and password are required.'}), 400
+
+    if len(username) < 3 or len(username) > 30:
+        return jsonify({'error': 'Username must be between 3 and 30 characters.'}), 400
+
+    if len(password) < 8:
+        return jsonify({'error': 'Password must be at least 8 characters long.'}), 400
 
     db = get_db()
     try:
         password_hash = ph.hash(password)
         db.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)', (username, password_hash))
         db.commit()
-        return jsonify({'ok': True, 'message': 'user created'}), 201
+        return jsonify({'ok': True, 'message': 'Account created successfully.'}), 201
     except sqlite3.IntegrityError:
-        return jsonify({'error': 'username already exists'}), 409
-    except Exception as e:
-        return jsonify({'error': 'internal error'}), 500
+        return jsonify({'error': 'Username is already taken.'}), 409
+    except Exception:
+        return jsonify({'error': 'An error occurred while creating your account.'}), 500
 
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json() or {}
-    username = (data.get('username') or '').strip()
+    username = (data.get('username') or '').strip().lower()
     password = data.get('password') or ''
+
     if not username or not password:
-        return jsonify({'error': 'username and password are required'}), 400
+        return jsonify({'error': 'Username and password are required.'}), 400
 
     db = get_db()
     row = db.execute('SELECT id, username, password_hash FROM users WHERE username = ?', (username,)).fetchone()
+    
+    invalid_credentials = (jsonify({'error': 'Invalid username or password.'}), 401)
+
     if not row:
-        return jsonify({'error': 'invalid credentials'}), 401
+        return invalid_credentials
 
     try:
         ph.verify(row['password_hash'], password)
     except VerifyMismatchError:
-        return jsonify({'error': 'invalid credentials'}), 401
+        return invalid_credentials
     except Exception:
-        return jsonify({'error': 'internal error'}), 500
+        return jsonify({'error': 'An internal error occurred.'}), 500
 
+    now = datetime.datetime.now(timezone.utc)
     payload = {
         'sub': row['username'],
-        'iat': datetime.datetime.utcnow(),
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(seconds=JWT_EXP_DELTA_SECONDS)
+        'user_id': row['id'],
+        'iat': now,
+        'exp': now + datetime.timedelta(seconds=JWT_EXP_DELTA_SECONDS)
     }
     token = jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALGORITHM)
-    return jsonify({'token': token})
 
-def decode_token_from_header():
-    auth = request.headers.get('Authorization', '')
-    if not auth.startswith('Bearer '):
-        return None, ('missing token', 401)
-    token = auth.split(' ', 1)[1]
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        return payload, None
-    except jwt.ExpiredSignatureError:
-        return None, ('token expired', 401)
-    except jwt.InvalidTokenError:
-        return None, ('invalid token', 401)
+    response = make_response(jsonify({'ok': True, 'message': 'Logged in successfully.'}))
+    
+    # Store token in HttpOnly cookie to mitigate XSS exposure
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        httponly=True,
+        secure=(ENV == 'production'),  # Transmit only over HTTPS in production
+        samesite='Lax',
+        max_age=JWT_EXP_DELTA_SECONDS
+    )
+    return response
 
-@app.route('/api/protected')
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    response = make_response(jsonify({'ok': True, 'message': 'Logged out.'}))
+    response.set_cookie(COOKIE_NAME, '', expires=0)
+    return response
+
+@app.route('/api/protected', methods=['GET'])
 def protected():
-    payload, err = decode_token_from_header()
+    payload, err = get_jwt_payload()
     if err:
         return jsonify({'error': err[0]}), err[1]
-    return jsonify({'message': f"Hello {payload['sub']}, this is protected data."})
-
-if __name__ == '__main__':
-    with app.app_context():
-        init_db()
-    # Do NOT use debug=True in production. This app is for local/dev use only.
-    app.run(host='127.0.0.1', port=5000)
+    return jsonify({'message': f"Hello, {payload['sub']}! Access granted to protected area."})
