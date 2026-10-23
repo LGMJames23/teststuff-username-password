@@ -14,9 +14,9 @@ async function postJSON(url, body) {
 }
 
 qs("regBtn").addEventListener("click", async () => {
-  const username = qs("regUsername").value.trim();
-  const name = qs("regName").value.trim();
-  const password = qs("regPassword").value;
+  const username = qs("regUsername")?.value.trim() || "";
+  const name = qs("regName")?.value.trim() || "";
+  const password = qs("regPassword")?.value || "";
 
   const res = await postJSON("/api/register", { username, name, password });
 
@@ -26,8 +26,8 @@ qs("regBtn").addEventListener("click", async () => {
 });
 
 qs("loginBtn").addEventListener("click", async () => {
-  const username = qs("loginUsername").value.trim();
-  const password = qs("loginPassword").value;
+  const username = qs("loginUsername")?.value.trim() || "";
+  const password = qs("loginPassword")?.value || "";
 
   const res = await fetch("/api/login", {
     method: "POST",
