@@ -2,13 +2,16 @@ import os
 import sqlite3
 import datetime
 from datetime import timezone
+from functools import wraps
 
 from flask import Flask, request, jsonify, render_template, g, make_response
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 import jwt
 
-# Configuration
+# =====================================================================
+# 1. CONFIGURATION & INITIALIZATION
+# =====================================================================
 ENV = os.environ.get("FLASK_ENV", "production")
 DATABASE = os.environ.get("DB_PATH", "users.db")
 SECRET_KEY = os.environ.get("SECRET_KEY")
@@ -25,22 +28,28 @@ COOKIE_NAME = "access_token"
 app = Flask(__name__)
 ph = PasswordHasher()
 
-# Database setup
+
+# =====================================================================
+# 2. DATABASE & MIDDLEWARE HELPERS
+# =====================================================================
 def get_db():
+    """Establishes and returns a secure, high-concurrency database connection."""
     db = getattr(g, "_database", None)
     if db is None:
         db = g._database = sqlite3.connect(DATABASE, timeout=10)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL;")
+        db.execute("PRAGMA journal_mode=WAL;")  # Optimized concurrency
     return db
 
 @app.teardown_appcontext
-def close_connection(exception):
+def close_connection(exception=None):
+    """Safely closes the database connection when a request ends."""
     db = getattr(g, "_database", None)
     if db is not None:
         db.close()
 
 def init_db():
+    """Initializes the database schema if it doesn't already exist."""
     with app.app_context():
         db = get_db()
         db.execute("""
@@ -56,16 +65,20 @@ def init_db():
 
 init_db()
 
-# Security Header Middleware
 @app.after_request
 def apply_security_headers(response):
+    """Applies OWASP security headers to mitigate basic web vulnerabilities."""
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     return response
 
-# Token Retrieval Helper
+
+# =====================================================================
+# 3. AUTHENTICATION DECORATOR & RE-USE FUNCTIONS
+# =====================================================================
 def get_jwt_payload():
+    """Extracts and verifies JWT payloads from cookies or Authorization headers."""
     token = request.cookies.get(COOKIE_NAME)
 
     if not token:
@@ -84,7 +97,23 @@ def get_jwt_payload():
     except jwt.InvalidTokenError:
         return None, ("Invalid token", 401)
 
-# Routes
+def login_required(f):
+    """
+    Custom decorator to protect endpoints. 
+    Injects the validated user payload into the route function as `current_user`.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        payload, err = get_jwt_payload()
+        if err:
+            return jsonify({"error": err[0]}), err[1]
+        return f(payload, *args, **kwargs)
+    return decorated
+
+
+# =====================================================================
+# 4. SYSTEM ENDPOINTS (Registration, Login, Logout)
+# =====================================================================
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -96,22 +125,24 @@ def register():
     name = (data.get("name") or "").strip()
     password = data.get("password") or ""
 
+    # Input Boundary Protections
     if not username or not name or not password:
         return jsonify({"error": "Username, name, and password are required."}), 400
-
     if len(username) < 3 or len(username) > 30:
         return jsonify({"error": "Username must be between 3 and 30 characters."}), 400
-
     if len(name) < 2 or len(name) > 100:
         return jsonify({"error": "Name must be between 2 and 100 characters."}), 400
-
     if len(password) < 8:
         return jsonify({"error": "Password must be at least 8 characters long."}), 400
 
+    # Process Hashing outside DB Transaction
+    try:
+        password_hash = ph.hash(password)
+    except Exception:
+        return jsonify({"error": "Internal error setting up security."}), 500
+
     db = get_db()
     try:
-        # Argon2 automatically generates a random salt and stores it in the hash string.
-        password_hash = ph.hash(password)
         db.execute(
             "INSERT INTO users (username, name, password_hash) VALUES (?, ?, ?)",
             (username, name, password_hash)
@@ -139,12 +170,18 @@ def login():
     ).fetchone()
 
     invalid_credentials = (jsonify({"error": "Invalid username or password."}), 401)
-
     if not row:
         return invalid_credentials
 
     try:
         ph.verify(row["password_hash"], password)
+        
+        # Adaptive Upgrade: Automatically upgrades weaker hashes if Argon2 parameters change
+        if ph.check_needs_rehash(row["password_hash"]):
+            new_hash = ph.hash(password)
+            db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, row["id"]))
+            db.commit()
+            
     except VerifyMismatchError:
         return invalid_credentials
     except Exception:
@@ -164,14 +201,10 @@ def login():
         jsonify({
             "ok": True,
             "message": "Logged in successfully.",
-            "user": {
-                "username": row["username"],
-                "name": row["name"],
-            }
+            "user": {"username": row["username"], "name": row["name"]}
         })
     )
 
-    # Store token in HttpOnly cookie to mitigate XSS exposure
     response.set_cookie(
         COOKIE_NAME,
         token,
@@ -188,11 +221,18 @@ def logout():
     response.set_cookie(COOKIE_NAME, "", expires=0)
     return response
 
+
+# =====================================================================
+# 5. YOUR CUSTOM APPLICATION ENDPOINTS (Examples)
+# =====================================================================
 @app.route("/api/protected", methods=["GET"])
-def protected():
-    payload, err = get_jwt_payload()
-    if err:
-        return jsonify({"error": err[0]}), err[1]
+@login_required
+def protected(current_user):
+    """An example of using the @login_required decorator template."""
     return jsonify({
-        "message": f"Hello, {payload.get('name') or payload.get('sub')}! Access granted to protected area."
+        "message": f"Hello, {current_user.get('name')}! Access granted to protected area.",
+        "user_details": current_user
     })
+
+if __name__ == "__main__":
+    app.run(debug=(ENV != "production"))
